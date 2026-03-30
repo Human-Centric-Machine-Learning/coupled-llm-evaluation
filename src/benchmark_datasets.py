@@ -1,6 +1,6 @@
-from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache
+from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache, BitsAndBytesConfig
 import torch
-from src.joint_sampling import joint_sampler
+from src.joint_sampling import joint_sampler, joint_top_p_sampler
 import json
 import argparse
 from datasets import load_dataset
@@ -11,6 +11,7 @@ import pandas as pd
 tqdm.pandas()
 
 DEBUG = False
+HUMAN_EVAL = False # set to True for experiment with the HumanEval dataset
 
 mmlu_dev_ds = load_dataset('cais/mmlu', name='all', split='dev', cache_dir=f"./data/original")
 mmlu_dev_ds.set_format('pandas')
@@ -47,15 +48,41 @@ def mmlu_format(row, system="", few_shot=0, few_shot_system=False):
   row['query'] = query
   return row
 
+def gsm8k_format(task, system, few_shot=0, few_shot_system=False):
+  # format the input and system prompts
+  task['query'] = f"{task['question']}\nThe answer is"
+  task['system'] = system
+  return task
+
+def human_eval_format(task, assistant, few_shot=0, few_shot_system=False):
+  # format the input prompt and assistant prefix 
+  task['user'] = f"\n\nWrite a solution to the following problem and make sure that it passes the tests:\n```python\n{task['prompt']}\n\n```"
+  task['assistant'] = f"\n\nHere is the completed function:\n```python\n{task['prompt']}"
+  task['system'] = ''
+  return task
+
 DATASET = {
   'mmlu': {
     'name': 'all',
     'task_formatter': lambda task, system, few_shot=0, few_shot_system=False: mmlu_format(task, system, few_shot, few_shot_system),
     'dataset_path': 'cais/mmlu',
     'reply_column_name': 0
-  }
+  },
+  'gsm8k': {
+    'name': 'main',
+    'task_formatter': lambda task, system, few_shot=0, few_shot_system=False: gsm8k_format(task, system, few_shot, few_shot_system),
+    'dataset_path': 'openai/gsm8k',
+    'reply_column_name': 'query'
+  },
+    'human_eval': {
+        'name': 'openai_humaneval',
+        'task_formatter': lambda task, system, few_shot=0, few_shot_system=False: human_eval_format(task, system, few_shot, few_shot_system),
+        'dataset_path': 'openai/openai_humaneval',
+        'reply_column_name': 'query'
+    }
 }
-def init_model_joint_vocab(model_name, cache_dir, vocab_dir):
+
+def init_model_joint_vocab(model_name, cache_dir, vocab_dir, quantize):
   
   if DEBUG: print("Reading the joint vocabulary...")
   # read the id2token mapping
@@ -71,8 +98,21 @@ def init_model_joint_vocab(model_name, cache_dir, vocab_dir):
   if DEBUG: print("Loading the model and tokenizer...")
   # load the model and tokenizer
   tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=cache_dir)
-  model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, device_map="cuda:0")
-  
+  if quantize == 4:
+    print("Quantizing the model (4) bit...")
+    quantization_config = BitsAndBytesConfig(
+      load_in_4bit=True,
+      bnb_4bit_quant_type="nf4",
+      bnb_4bit_compute_dtype=torch.float16,
+    )
+    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, device_map="cuda:0", quantization_config=quantization_config)
+  elif quantize == 8:
+    print("Quantizing the model (8)...")
+    quantization_config = BitsAndBytesConfig(load_in_8bit=True)
+    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, device_map="cuda:0", quantization_config=quantization_config)
+  else:
+    model = AutoModelForCausalLM.from_pretrained(model_name, cache_dir=cache_dir, device_map="cuda:0")
+
   # set the model in eval mode
   model.eval()
 
@@ -91,16 +131,25 @@ def init_model_joint_vocab(model_name, cache_dir, vocab_dir):
   }
   return model, tokenizer, vocab_config
 
-def generate(model, tokenizer, vocab_config, user, system, seed, rng, temperature, max_length):
+def generate(model, model_name, tokenizer, vocab_config, user, system, seed, rng, temperature, max_length, p=1.0):
   # initialize the random number generator
   rng.manual_seed(seed)
 
   # encode the input text as chat
-  chat = [
-    {"role": "system", "content": system},
-    {"role": "user", "content": user}
-  ]
-  inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
+  if HUMAN_EVAL:
+    chat = [
+        {"role": "user", "content": user},
+        {"role": "assistant", "content": system} #system here is the assistant prefix
+    ]
+  else: 
+    chat = [
+        {"role": "system", "content": system},
+        {"role": "user", "content": user}
+    ]
+  if model_name == "Qwen/Qwen3-8B":
+    inputs = tokenizer.apply_chat_template(chat, enable_thinking=False, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
+  else:
+    inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
 
   # generate the response
   eos_token_id = tokenizer.eos_token_id
@@ -117,10 +166,13 @@ def generate(model, tokenizer, vocab_config, user, system, seed, rng, temperatur
 
       outputs = model(**inputs, cache_position=cache_position, past_key_values=past_key_values, use_cache=True)
       logits = outputs.logits[:, -1, :len(vocab_config['model_token2id'])]
-      probs = torch.nn.functional.softmax(logits / temperature, dim=-1)
+      probs = torch.nn.functional.softmax(logits / temperature, dim=-1, dtype=torch.float32)
 
       # sample the next token using the Gumbel-Max SCM over the joint vocabulary
-      next_token_ids = joint_sampler(probs, vocab_config['n_total'], vocab_config['model_indices'], vocab_config['total_id2token'], vocab_config['model_token2id'], rng)
+      if p < 1.0:
+        next_token_ids = joint_top_p_sampler(probs, vocab_config['n_total'], vocab_config['model_indices'], vocab_config['total_id2token'], vocab_config['model_token2id'], p, rng)
+      else:
+        next_token_ids = joint_sampler(probs, vocab_config['n_total'], vocab_config['model_indices'], vocab_config['total_id2token'], vocab_config['model_token2id'], rng)
 
       generated_ids = torch.cat([generated_ids, next_token_ids], dim=-1)      
 
@@ -156,11 +208,13 @@ def run_eval(
     chunk_idx : int, 
     few_shot : int,
     few_shot_system : bool,
-    n_repeats : int = 1
+    n_repeats : int = 1,
+    quantize : int = 0,
+    p : float = 1.0
     ):
 
-  # initilize the model and get the joint and model vocabulary configuration 
-  model, tokenizer, vocab_config = init_model_joint_vocab(model_name, cache_dir, vocab_dir)
+  # initialize the model and get the joint and model vocabulary configuration 
+  model, tokenizer, vocab_config = init_model_joint_vocab(model_name, cache_dir, vocab_dir, quantize)
   
   # data configuration dict
   ds_conf = DATASET[dataset_name]
@@ -194,8 +248,9 @@ def run_eval(
 
   if DEBUG: print("Preparing the questions for the model...")
   
-  # prepare the questions and system prompts for the model 
-  ds = ds.progress_apply(ds_conf['task_formatter'], system=system, few_shot=few_shot, few_shot_system=few_shot_system, axis=1)[['query', 'system']]
+  # prepare the questions and system prompts (or the response prefix if necessary) for the model 
+  chat_template_keys = ['user', 'assistant'] if HUMAN_EVAL else ['query', 'system']
+  ds = ds.progress_apply(ds_conf['task_formatter'], system=system, few_shot=few_shot, few_shot_system=few_shot_system, axis=1)[chat_template_keys]
   
   # generate one seed for each question in the dataset 
   ds['seed'] = seed_rng.integers(2**24, 2**32, len(ds))
@@ -203,10 +258,15 @@ def run_eval(
   if DEBUG: print(ds)
 
   # ask the questions to the model
-  responses = ds.progress_apply(lambda row: generate(model, tokenizer, vocab_config, row['query'], row['system'], row['seed'], rng, temperature, max_length), axis=1)  
+  responses = ds.progress_apply(lambda row: generate(model, model_name, tokenizer, vocab_config, row[chat_template_keys[0]], row[chat_template_keys[1]], row['seed'], rng, temperature, max_length, p), axis=1)  
   
   # save responses
-  results_path = f"./outputs/{dataset_name}/{model_name.split('/')[-1]}"
+  results_path = f"./outputs/{dataset_name}/{vocab_dir.split('_')[-1]}"
+  if temperature != 0.7:
+    results_path += f"/temperature_top_p/temperature_{temperature}"
+  if p < 1.0:
+    results_path += f"/temperature_top_p/temperature_{temperature}_p_{p}"
+  results_path += f"/{model_name.split('/')[-1]}{'-bnb-'+str(quantize)+'bit' if quantize > 0 else ''}"
   if not os.path.exists(results_path):
     os.makedirs(results_path)
   responses.to_csv(f"{results_path}/responses_{start}_{end}_seed{seed}.csv", index=False)
@@ -215,23 +275,25 @@ def run_eval(
 if __name__ == '__main__':
   
   parser = argparse.ArgumentParser()
-  parser.add_argument("--model_name", type=str, required=True, help="Name of the model")
-  parser.add_argument("--dataset_name", type=str, required=True, choices=['mmlu'], help="Name of the dataset")
+  parser.add_argument("--model_name", type=str, required=True, default="meta-llama/Llama-3.1-8B-Instruct", help="Name of the model")
+  parser.add_argument("--dataset_name", type=str, required=True, choices=['mmlu', 'gsm8k', 'human_eval'], help="Name of the dataset")
   parser.add_argument("--cache_dir", type=str, default="./models", help="Directory that contains model files")
   parser.add_argument("--data_cache_dir", type=str, default="./data/original", help="Directory that contains data files")
-  parser.add_argument("--vocab_dir", type=str, default="./models", help="Directory that contains files for the joint vocabulary")
+  parser.add_argument("--vocab_dir", type=str, default="./models/models_llama", choices=["./models/models_llama", "./models/models_mistral", "./models/models_qwen"], help="Directory that contains files for the joint vocabulary")
   parser.add_argument("--system", type=str, default="You will be given multiple choice questions. Please reply with a single character 'A', 'B', 'C', or 'D' only. DO NOT explain your reply.", help="System prompt")
   parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
-  parser.add_argument("--temperature", type=float, default=0.3, help="Softmax temperature")
+  parser.add_argument("--temperature", type=float, default=0.7, help="Softmax temperature")
   parser.add_argument("--max_length", type=int, default=1000, help="Maximum length of the generated response")
   parser.add_argument("--chunk_size", type=int, default=250, help="Size of the chunk of the dataset to run")
   parser.add_argument("--chunk_idx", type=int, default=0, help="Index of the chunk of the dataset to run")
-  parser.add_argument("--few_shot", type=int, default=0, help="Number of examples to use for few-shot learning")
-  parser.add_argument("--few_shot_system", action=argparse.BooleanOptionalAction, type=bool, default=False, help="Whether to add few-shot examples to the system prompt")
+  parser.add_argument("--few_shot", type=int, default=0, help="Number of examples to use for few-shot learning (Supported only for mmlu)")
+  parser.add_argument("--few_shot_system", action=argparse.BooleanOptionalAction, type=bool, default=False, help="Whether to add few-shot examples to the system prompt (Supported only for mmlu)")
   parser.add_argument("--n_repeats", type=int, default=1, help="Number of seeds per query")
+  parser.add_argument("--quantize", type=int, default=0, choices=[0, 4, 8], help="Number of quantization bits (default 0 for no quantization)")
+  parser.add_argument("--p", type=float, default=1.0, help="Top-p sampling parameter (default 1.0 for no top-p sampling)")
   args = parser.parse_args()
 
   if DEBUG: print(args)
-  
+  HUMAN_EVAL = args.dataset_name == 'human_eval'
   run_eval(**vars(args))
 
