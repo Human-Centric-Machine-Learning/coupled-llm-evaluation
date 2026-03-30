@@ -1,0 +1,10 @@
+{
+    "models" : [
+        "Qwen/Qwen2.5-7B-Instruct",
+        "Qwen/Qwen2.5-7B-Instruct-AWQ",
+        "Qwen/Qwen2.5-3B-Instruct",
+        "Qwen/Qwen2.5-1.5B-Instruct",
+        "Qwen/Qwen3-8B",
+        "alibaba-pai/DistilQwen2.5-3B-Instruct"
+    ]
+}
