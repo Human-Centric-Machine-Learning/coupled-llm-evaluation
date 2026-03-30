@@ -91,7 +91,8 @@ def run_lmsys(
             {"role": "system", "content": system},
             {"role": "user", "content": user}
         ]
-        inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
+        
+        inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True, enable_thinking=False).to(model.device)
 
         # generate the response
         eos_token_id = tokenizer.eos_token_id
@@ -143,9 +144,9 @@ def run_lmsys(
 
     output_dir=output_dir+'/'+model_name
     if quantize==4:
-        output_dir=output_dir+'/q4'
+        output_dir=output_dir+'-q4'
     elif quantize==8:
-        output_dir=output_dir+'/q8'
+        output_dir=output_dir+'-q8'
     file_path = Path(f"{output_dir}/{output_file}.json")
     if file_path.exists():
         os.remove(file_path)
