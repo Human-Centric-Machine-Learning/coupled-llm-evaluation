@@ -3,7 +3,7 @@ source env/bin/activate
 model_name="meta-llama/Llama-3.1-8B-Instruct"
 user="What is the size of the sun?"
 cache_dir="./models"
-vocab_dir="./models"
+vocab_dir="./models/models_llama"
 system="Keep your responses short and to the point."
 seed=42
 temperature=0.7
