@@ -2,7 +2,6 @@ from transformers import AutoTokenizer, AutoModelForCausalLM, DynamicCache, Bits
 import torch
 import json
 import argparse
-import os
 
 def joint_sampler(probs, n_total, model_indices, total_id2token, model_token2id, rng):
 
@@ -25,8 +24,39 @@ def joint_sampler(probs, n_total, model_indices, total_id2token, model_token2id,
 
   return model_token_id
 
-def generate(model_name, user, cache_dir, vocab_dir, system, seed, temperature, max_length, quantize):
+def joint_top_p_sampler(probs, n_total, model_indices, total_id2token, model_token2id, p, rng):
 
+  # sample Gumbels
+  u = torch.rand(n_total, generator=rng, device=probs.device)
+  gumbels = -torch.log(-torch.log(u + 1e-20) + 1e-20)
+
+  total_probs = torch.zeros(n_total, device=probs.device)
+  total_probs[model_indices] = probs
+  
+  # sort the probabilities and their corresponding indices
+  probs_sort, probs_idx = torch.sort(total_probs, dim=-1, descending=True)
+  probs_sum = torch.cumsum(probs_sort, dim=-1)
+  mask = probs_sum - probs_sort > p
+
+  # normalize probs
+  probs_sort[mask] = 0.0
+  probs_sort.div_(probs_sort.sum(dim=-1, keepdim=True))
+
+  # reorder noises based on sorted probs
+  gumbel_noise_reordered=torch.gather(gumbels,dim=-1,index=probs_idx)
+  gumbel_noise_reordered[mask] = 0.0
+
+  # sample token id from the top-p filtered distribution using Gumbel-Max
+  sampling = torch.log(probs_sort + 1e-20) + gumbel_noise_reordered
+  argmax = torch.argmax(sampling, keepdim=True, dim=-1)
+  argmax = torch.gather(probs_idx, -1, argmax)
+  
+  # map it back to the model's token ids
+  model_token_id = torch.tensor([[model_token2id[total_id2token[str(argmax.item())]]]], device=probs.device)
+  
+  return model_token_id
+  
+def generate(model_name, user, cache_dir, vocab_dir, system, seed, temperature, max_length, quantize, p):
 
   print("Reading the joint vocabulary...")
   # read the id2token mapping
@@ -69,7 +99,10 @@ def generate(model_name, user, cache_dir, vocab_dir, system, seed, temperature, 
     {"role": "system", "content": system},
     {"role": "user", "content": user}
   ]
-  inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
+  if model_name == "Qwen/Qwen3-8B":
+    inputs = tokenizer.apply_chat_template(chat, enable_thinking=False, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
+  else:
+    inputs = tokenizer.apply_chat_template(chat, add_generation_prompt=True, return_tensors="pt", return_dict=True).to(model.device)
 
   # initialize the random number generator
   rng = torch.Generator(device=model.device)
@@ -92,7 +125,10 @@ def generate(model_name, user, cache_dir, vocab_dir, system, seed, temperature, 
       probs = torch.nn.functional.softmax(logits / temperature, dim=-1, dtype=torch.float32)
 
       # sample the next token using the Gumbel-Max SCM over the joint vocabulary
-      next_token_ids = joint_sampler(probs, n_total, model_indices, total_id2token, model_token2id, rng)
+      if p < 1.0:
+        next_token_ids = joint_top_p_sampler(probs, n_total, model_indices, total_id2token, model_token2id, p, rng)
+      else:
+        next_token_ids = joint_sampler(probs, n_total, model_indices, total_id2token, model_token2id, rng)
       generated_ids = torch.cat([generated_ids, next_token_ids], dim=-1)      
 
       # NOTE: use caching to speed-up the autoregressive generation
@@ -122,6 +158,7 @@ if __name__ == "__main__":
   parser.add_argument("--seed", type=int, default=42, help="Seed for reproducibility")
   parser.add_argument("--temperature", type=float, default=0.7, help="Softmax temperature")
   parser.add_argument("--max_length", type=int, default=1000, help="Maximum length of the generated response")
+  parser.add_argument("--p", type=float, default=1.0, help="Top-p sampling threshold (set to 1.0 for no top-p sampling)")
   parser.add_argument("--quantize", type=int, choices=[0,4,8], default=0, help="Choose quantization method (if any) the model")
   args = parser.parse_args()
 
