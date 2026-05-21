@@ -77,7 +77,7 @@ In case you have questions about the code, you identify potential bugs or you wo
 If you use parts of the code in this repository for your own research, please consider citing:
 
 ```
-@article{benz2026evaluation,
+@inproceedings{benz2026evaluation,
   title={Evaluation of Large Language Models via Coupled Token Generation}, 
   author={Nina Corvelo Benz and Stratis Tsirtsis and Eleni Straitouri and Ivi Chatzi and Ander Artola Velasco and Suhas Thejaswi and Manuel Gomez-Rodriguez},
   year={2026},
